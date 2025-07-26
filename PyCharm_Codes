@@ -1,0 +1,159 @@
+import cv2
+import serial
+import time
+import numpy as np
+from threading import Thread, Lock
+from queue import Queue
+
+# ------------------- SETTINGS -------------------
+SERIAL_PORT = 'COMX'  # Arduino port # Don't forget to select a valid Port
+BAUD_RATE = 115200  # Serial communication speed
+CAMERA_ID = 0  # Camera ID (usually 0)
+RESOLUTION = (640, 480)  # Resolution for better recognition
+TARGET_FPS = 30  # FPS for smooth tracking
+SMOOTHING_FACTOR = 0.25  # Motion smoothing (between 0 and 1)
+FACE_SCALE_FACTOR = 1.05  # Face detection sensitivity
+FACE_MIN_NEIGHBORS = 5  # Face detection accuracy parameter
+MIN_FACE_SIZE = (120, 120)  # Minimum face size
+
+
+# ------------------------------------------------
+
+class ArduinoController:
+    def __init__(self):
+        self.ser = None
+        self.lock = Lock()
+        self.connect()
+
+    def connect(self):
+        try:
+            self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            time.sleep(2)  # Arduino startup delay
+            print("Connected to Arduino!")
+            # Center the servos
+            self.send_angles(90, 90)
+        except Exception as e:
+            print(f"Connection error: {e}")
+            self.ser = None
+
+    def send_angles(self, x, y):
+        if self.ser is None:
+            self.connect()
+            if self.ser is None:
+                return
+
+        with self.lock:
+            try:
+                # Clamp angles between 0 and 180
+                x = max(0, min(180, int(x)))
+                y = max(0, min(180, int(y)))
+                cmd = f"{x},{y}\n"
+                self.ser.write(cmd.encode())
+            except Exception as e:
+                print(f"Send error: {e}")
+                self.ser.close()
+                self.ser = None
+
+
+class FaceTracker:
+    def __init__(self):
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.prev_x = 90
+        self.prev_y = 90
+        self.frame_count = 0
+
+    def detect_face(self, frame):
+        # Detect face every 2 frames (for performance)
+        if self.frame_count % 2 == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=FACE_SCALE_FACTOR,
+                minNeighbors=FACE_MIN_NEIGHBORS,
+                minSize=MIN_FACE_SIZE
+            )
+            self.frame_count = 0
+            return faces
+        self.frame_count += 1
+        return []
+
+    def calculate_angles(self, frame, faces):
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            center_x = x + w // 2
+            center_y = y + h // 2
+
+            # Precise angle calculation
+            target_x = 180 - (center_x / frame.shape[1]) * 180
+            target_y = (center_y / frame.shape[0]) * 180
+
+            # Smooth transition (PID-like behavior)
+            current_x = self.prev_x * (1 - SMOOTHING_FACTOR) + target_x * SMOOTHING_FACTOR
+            current_y = self.prev_y * (1 - SMOOTHING_FACTOR) + target_y * SMOOTHING_FACTOR
+
+            self.prev_x, self.prev_y = current_x, current_y
+
+            return current_x, current_y, (x, y, w, h)
+        return None, None, None
+
+
+def main():
+    # Initialization
+    arduino = ArduinoController()
+    face_tracker = FaceTracker()
+
+    cap = cv2.VideoCapture(CAMERA_ID)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+
+    # Calibration parameters
+    X_OFFSET = 0  # X-axis calibration (adjust between -20 and +20)
+    Y_OFFSET = 0  # Y-axis calibration
+
+    try:
+        while True:
+            start_time = time.time()
+
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Face detection
+            faces = face_tracker.detect_face(frame)
+            x_angle, y_angle, face_rect = face_tracker.calculate_angles(frame, faces)
+
+            if x_angle is not None:
+                # Apply calibration adjustments
+                calibrated_x = x_angle + X_OFFSET
+                calibrated_y = y_angle + Y_OFFSET
+
+                # Send to Arduino
+                arduino.send_angles(calibrated_x, calibrated_y)
+
+                # Visualization
+                x, y, w, h = face_rect
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, f"X:{int(calibrated_x)} Y:{int(calibrated_y)}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Display FPS
+            fps = 1 / (time.time() - start_time)
+            cv2.putText(frame, f"FPS: {int(fps)}",
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            cv2.imshow('Precision Face Tracking System', frame)
+            if cv2.waitKey(1) == ord('q'):
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if arduino.ser is not None:
+            arduino.send_angles(90, 90)  # Center the servos
+            arduino.ser.close()
+
+
+if __name__ == "__main__":
+    main()
